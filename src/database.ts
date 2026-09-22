@@ -1,5 +1,6 @@
 import Database from 'better-sqlite3';
 import { encrypt, decrypt, isEncrypted } from './crypto.js';
+import type { NutritionRow } from './nutrition.js';
 import type {
 	WhoopTokens,
 	WhoopCycle,
@@ -40,6 +41,41 @@ interface SleepTrendRow {
 	performance: number;
 	efficiency: number;
 }
+
+export interface NutritionDayRow {
+	date: string;
+	energy: number | null;
+	protein: number | null;
+	carbs: number | null;
+	fat: number | null;
+	fiber: number | null;
+	sugar: number | null;
+	weight: number | null;
+}
+
+export interface DailyOverviewRow extends NutritionDayRow {
+	recovery_score: number | null;
+	hrv: number | null;
+	rhr: number | null;
+	sleep_hours: number | null;
+	sleep_performance: number | null;
+	strain: number | null;
+	calories_burned: number | null;
+}
+
+// One row per day with the stored nutrition metrics side by side.
+const NUTRITION_PIVOT = `
+	SELECT date,
+		MAX(CASE WHEN metric = 'energy' THEN qty END) AS energy,
+		MAX(CASE WHEN metric = 'protein' THEN qty END) AS protein,
+		MAX(CASE WHEN metric = 'carbs' THEN qty END) AS carbs,
+		MAX(CASE WHEN metric = 'fat' THEN qty END) AS fat,
+		MAX(CASE WHEN metric = 'fiber' THEN qty END) AS fiber,
+		MAX(CASE WHEN metric = 'sugar' THEN qty END) AS sugar,
+		MAX(CASE WHEN metric = 'weight' THEN qty END) AS weight
+	FROM nutrition_daily
+	GROUP BY date
+`;
 
 interface StrainTrendRow {
 	date: string;
@@ -147,6 +183,16 @@ export class WhoopDatabase {
 			CREATE INDEX IF NOT EXISTS idx_recovery_created ON recovery(created_at);
 			CREATE INDEX IF NOT EXISTS idx_sleep_start ON sleep(start_time);
 			CREATE INDEX IF NOT EXISTS idx_workouts_start ON workouts(start_time);
+
+			-- Daily totals from Apple Health (MyFitnessPal etc.) via Health Auto Export
+			CREATE TABLE IF NOT EXISTS nutrition_daily (
+				date TEXT NOT NULL,
+				metric TEXT NOT NULL,
+				qty REAL NOT NULL,
+				units TEXT,
+				updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+				PRIMARY KEY (date, metric)
+			);
 
 			INSERT OR IGNORE INTO sync_state (id) VALUES (1);
 		`);
@@ -395,6 +441,68 @@ export class WhoopDatabase {
 			WHERE strain IS NOT NULL AND start_time >= DATE('now', '-' || ? || ' days')
 			ORDER BY start_time DESC
 		`).all(days) as StrainTrendRow[];
+	}
+
+	upsertNutrition(rows: NutritionRow[]): void {
+		const stmt = this.db.prepare(`
+			INSERT OR REPLACE INTO nutrition_daily (date, metric, qty, units, updated_at)
+			VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+		`);
+		const insertMany = this.db.transaction((items: NutritionRow[]) => {
+			for (const r of items) {
+				stmt.run(r.date, r.metric, r.qty, r.units);
+			}
+		});
+		insertMany(rows);
+	}
+
+	getNutritionUnits(): Record<string, string> {
+		const rows = this.db.prepare(`
+			SELECT metric, units FROM nutrition_daily
+			WHERE units IS NOT NULL AND units <> ''
+			GROUP BY metric
+		`).all() as { metric: string; units: string }[];
+		return Object.fromEntries(rows.map(r => [r.metric, r.units]));
+	}
+
+	getNutritionDaily(days: number): NutritionDayRow[] {
+		return this.db.prepare(`
+			SELECT * FROM (${NUTRITION_PIVOT})
+			WHERE date >= DATE('now', '-' || ? || ' days')
+			ORDER BY date DESC
+		`).all(days) as NutritionDayRow[];
+	}
+
+	// Whoop cycles run from sleep onset to the next sleep onset, so a cycle is
+	// assigned to the calendar day that lies 12 hours after its start. Recovery
+	// and sleep are joined through Whoop's own ids (recovery.id = cycle id).
+	getDailyOverview(days: number): DailyOverviewRow[] {
+		return this.db.prepare(`
+			WITH whoop AS (
+				SELECT DATE(c.start_time, '+12 hours') AS date,
+					MAX(r.recovery_score) AS recovery_score,
+					MAX(r.hrv_rmssd) AS hrv,
+					MAX(r.resting_hr) AS rhr,
+					MAX(ROUND((s.total_in_bed_milli - s.total_awake_milli) / 3600000.0, 2)) AS sleep_hours,
+					MAX(s.sleep_performance) AS sleep_performance,
+					MAX(c.strain) AS strain,
+					MAX(ROUND(c.kilojoule / 4.184)) AS calories_burned
+				FROM cycles c
+				LEFT JOIN recovery r ON r.id = c.id
+				LEFT JOIN sleep s ON s.id = r.sleep_id
+				GROUP BY DATE(c.start_time, '+12 hours')
+			),
+			food AS (${NUTRITION_PIVOT}),
+			dates AS (SELECT date FROM whoop UNION SELECT date FROM food)
+			SELECT d.date,
+				w.recovery_score, w.hrv, w.rhr, w.sleep_hours, w.sleep_performance, w.strain, w.calories_burned,
+				f.energy, f.protein, f.carbs, f.fat, f.fiber, f.sugar, f.weight
+			FROM dates d
+			LEFT JOIN whoop w ON w.date = d.date
+			LEFT JOIN food f ON f.date = d.date
+			WHERE d.date >= DATE('now', '-' || ? || ' days')
+			ORDER BY d.date DESC
+		`).all(days) as DailyOverviewRow[];
 	}
 
 	close(): void {

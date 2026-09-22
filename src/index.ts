@@ -7,6 +7,8 @@ import { createHash, timingSafeEqual } from 'node:crypto';
 import { WhoopClient } from './whoop-client.js';
 import { WhoopDatabase } from './database.js';
 import { WhoopSync } from './sync.js';
+import { parseHealthExport } from './nutrition.js';
+import { formatDailyOverview, formatNutritionReport } from './reports.js';
 
 interface ToolArguments {
 	days?: number;
@@ -173,6 +175,24 @@ function createMcpServer(): Server {
 				},
 			},
 			{
+				name: 'get_daily_overview',
+				description: 'Get a day-by-day table combining Whoop (recovery, HRV, resting HR, sleep, strain, calories burned) with nutrition from Apple Health/MyFitnessPal (calories eaten, energy balance, protein, carbs, fat), plus correlations between nutrition and next-day recovery. Use this for any question relating food or weight to recovery, sleep or training.',
+				inputSchema: {
+					type: 'object',
+					properties: { days: { type: 'number', description: 'Number of days to analyze (default: 14, max: 90)' } },
+					required: [],
+				},
+			},
+			{
+				name: 'get_nutrition',
+				description: 'Get daily nutrition totals from Apple Health (logged in MyFitnessPal): calories, protein, carbs, fat, fiber, sugar and body weight if available.',
+				inputSchema: {
+					type: 'object',
+					properties: { days: { type: 'number', description: 'Number of days to show (default: 14, max: 90)' } },
+					required: [],
+				},
+			},
+			{
 				name: 'get_auth_url',
 				description: 'Get the Whoop authorization URL to connect your account.',
 				inputSchema: { type: 'object', properties: {}, required: [] },
@@ -185,7 +205,7 @@ function createMcpServer(): Server {
 		const typedArgs = (args ?? {}) as ToolArguments;
 
 		try {
-			const dataTools = ['get_today', 'get_recovery_trends', 'get_sleep_analysis', 'get_strain_history'];
+			const dataTools = ['get_today', 'get_recovery_trends', 'get_sleep_analysis', 'get_strain_history', 'get_daily_overview'];
 			if (dataTools.includes(name)) {
 				const tokens = db.getTokens();
 				if (!tokens) {
@@ -341,6 +361,18 @@ function createMcpServer(): Server {
 					};
 				}
 
+				case 'get_daily_overview': {
+					const days = validateDays(typedArgs.days);
+					const text = formatDailyOverview(db.getDailyOverview(days), db.getNutritionUnits(), days);
+					return { content: [{ type: 'text', text }] };
+				}
+
+				case 'get_nutrition': {
+					const days = validateDays(typedArgs.days);
+					const text = formatNutritionReport(db.getNutritionDaily(days), db.getNutritionUnits(), days);
+					return { content: [{ type: 'text', text }] };
+				}
+
 				case 'get_auth_url': {
 					const scopes = ['read:profile', 'read:body_measurement', 'read:cycles', 'read:recovery', 'read:sleep', 'read:workout', 'offline'];
 					const url = client.getAuthorizationUrl(scopes, issueOAuthState());
@@ -376,7 +408,6 @@ async function main(): Promise<void> {
 		}
 
 		const app = express();
-		app.use(express.json());
 
 		app.get('/callback', async (req: Request, res: Response) => {
 			const code = req.query.code as string | undefined;
@@ -404,7 +435,7 @@ async function main(): Promise<void> {
 			res.json({ status: 'ok', authenticated: Boolean(db.getTokens()) });
 		});
 
-		app.all('/mcp/:secret', async (req: Request, res: Response) => {
+		app.all('/mcp/:secret', express.json(), async (req: Request, res: Response) => {
 			if (!isValidMcpSecret(req.params.secret)) {
 				res.status(404).send('Not found');
 				return;
@@ -447,6 +478,32 @@ async function main(): Promise<void> {
 
 			res.status(405).send('Method not allowed');
 		});
+
+		// Apple Health data from the Health Auto Export app (REST API automation,
+		// JSON). The secret is checked before the (larger) body is parsed.
+		app.post(
+			'/ingest/:secret',
+			(req: Request, res: Response, next) => {
+				if (!isValidMcpSecret(req.params.secret)) {
+					res.status(404).send('Not found');
+					return;
+				}
+				next();
+			},
+			express.json({ limit: '25mb' }),
+			(req: Request, res: Response) => {
+				try {
+					const rows = parseHealthExport(req.body);
+					db.upsertNutrition(rows);
+					const days = new Set(rows.map(r => r.date)).size;
+					process.stdout.write(`Ingested ${rows.length} nutrition values for ${days} day(s)\n`);
+					res.json({ ok: true, values: rows.length, days });
+				} catch (error) {
+					const message = error instanceof Error ? error.message : 'Invalid payload';
+					res.status(400).json({ ok: false, error: message });
+				}
+			},
+		);
 
 		app.get('/sse', (_req: Request, res: Response) => {
 			res.status(410).send('SSE endpoint deprecated. Use /mcp with Streamable HTTP transport.');
