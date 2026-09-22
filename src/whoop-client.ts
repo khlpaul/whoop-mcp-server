@@ -44,13 +44,13 @@ export class WhoopClient {
 		this.tokens = tokens;
 	}
 
-	getAuthorizationUrl(scopes: string[]): string {
+	getAuthorizationUrl(scopes: string[], state: string): string {
 		const params = new URLSearchParams({
 			client_id: this.clientId,
 			redirect_uri: this.redirectUri,
 			response_type: 'code',
 			scope: scopes.join(' '),
-			state: crypto.randomUUID(),
+			state,
 		});
 		return `${WHOOP_AUTH_BASE}/auth?${params}`;
 	}
@@ -83,7 +83,21 @@ export class WhoopClient {
 		return tokens;
 	}
 
-	private async refreshTokens(): Promise<void> {
+	// WHOOP invalidates a refresh token as soon as it is used. Parallel requests
+	// (e.g. the four endpoints in syncDays) must therefore share one refresh
+	// instead of racing each other with the same token.
+	private refreshInFlight: Promise<void> | null = null;
+
+	private refreshTokens(): Promise<void> {
+		if (!this.refreshInFlight) {
+			this.refreshInFlight = this.performRefresh().finally(() => {
+				this.refreshInFlight = null;
+			});
+		}
+		return this.refreshInFlight;
+	}
+
+	private async performRefresh(): Promise<void> {
 		if (!this.tokens?.refresh_token) {
 			throw new Error('No refresh token available');
 		}

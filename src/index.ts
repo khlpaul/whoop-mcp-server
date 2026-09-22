@@ -3,6 +3,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { CallToolRequestSchema, ListToolsRequestSchema, ErrorCode, McpError } from '@modelcontextprotocol/sdk/types.js';
 import express, { type Request, type Response } from 'express';
+import { createHash, timingSafeEqual } from 'node:crypto';
 import { WhoopClient } from './whoop-client.js';
 import { WhoopDatabase } from './database.js';
 import { WhoopSync } from './sync.js';
@@ -19,7 +20,37 @@ const config = {
 	dbPath: process.env.DB_PATH ?? './whoop.db',
 	port: Number.parseInt(process.env.PORT ?? '3000', 10),
 	mode: process.env.MCP_MODE ?? 'http',
+	mcpSecret: process.env.MCP_SECRET ?? '',
 };
+
+// The MCP endpoint is only reachable at /mcp/<MCP_SECRET>. Hashing both sides
+// gives equal-length buffers, so the comparison is constant-time.
+function isValidMcpSecret(candidate: string): boolean {
+	const expected = createHash('sha256').update(config.mcpSecret).digest();
+	const actual = createHash('sha256').update(candidate).digest();
+	return timingSafeEqual(expected, actual);
+}
+
+// OAuth state values issued by get_auth_url; /callback only accepts these.
+const STATE_TTL_MS = 10 * 60 * 1000;
+const pendingStates = new Map<string, number>();
+
+function issueOAuthState(): string {
+	const now = Date.now();
+	for (const [state, expiresAt] of pendingStates) {
+		if (expiresAt < now) pendingStates.delete(state);
+	}
+	const state = crypto.randomUUID();
+	pendingStates.set(state, now + STATE_TTL_MS);
+	return state;
+}
+
+function consumeOAuthState(state: string | undefined): boolean {
+	if (!state) return false;
+	const expiresAt = pendingStates.get(state);
+	pendingStates.delete(state);
+	return expiresAt !== undefined && expiresAt >= Date.now();
+}
 
 const db = new WhoopDatabase(config.dbPath);
 const client = new WhoopClient({
@@ -312,7 +343,7 @@ function createMcpServer(): Server {
 
 				case 'get_auth_url': {
 					const scopes = ['read:profile', 'read:body_measurement', 'read:cycles', 'read:recovery', 'read:sleep', 'read:workout', 'offline'];
-					const url = client.getAuthorizationUrl(scopes);
+					const url = client.getAuthorizationUrl(scopes, issueOAuthState());
 					return {
 						content: [{
 							type: 'text',
@@ -340,6 +371,10 @@ async function main(): Promise<void> {
 		await server.connect(transport);
 		process.stderr.write('Whoop MCP server running on stdio\n');
 	} else {
+		if (config.mcpSecret.length < 32) {
+			throw new Error('MCP_SECRET must be set to at least 32 characters (generate one with: openssl rand -hex 32)');
+		}
+
 		const app = express();
 		app.use(express.json());
 
@@ -347,6 +382,11 @@ async function main(): Promise<void> {
 			const code = req.query.code as string | undefined;
 			if (!code) {
 				res.status(400).send('Missing authorization code');
+				return;
+			}
+
+			if (!consumeOAuthState(req.query.state as string | undefined)) {
+				res.status(400).send('Invalid or expired state. Request a new link via get_auth_url.');
 				return;
 			}
 
@@ -364,7 +404,12 @@ async function main(): Promise<void> {
 			res.json({ status: 'ok', authenticated: Boolean(db.getTokens()) });
 		});
 
-		app.all('/mcp', async (req: Request, res: Response) => {
+		app.all('/mcp/:secret', async (req: Request, res: Response) => {
+			if (!isValidMcpSecret(req.params.secret)) {
+				res.status(404).send('Not found');
+				return;
+			}
+
 			const sessionId = req.headers['mcp-session-id'] as string | undefined;
 
 			if (req.method === 'DELETE' && sessionId && transports.has(sessionId)) {
@@ -394,7 +439,9 @@ async function main(): Promise<void> {
 					await server.connect(transport);
 				}
 
-				await transport.handleRequest(req, res);
+				// express.json() has already consumed the request stream, so the
+				// parsed body must be handed over explicitly.
+				await transport.handleRequest(req, res, req.body);
 				return;
 			}
 
