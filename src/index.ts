@@ -69,21 +69,6 @@ if (existingTokens) {
 
 const sync = new WhoopSync(client, db);
 
-const SESSION_TTL_MS = 30 * 60 * 1000;
-const transports = new Map<string, { transport: StreamableHTTPServerTransport; lastAccess: number }>();
-
-function cleanupStaleSessions(): void {
-	const now = Date.now();
-	for (const [sessionId, session] of transports) {
-		if (now - session.lastAccess > SESSION_TTL_MS) {
-			session.transport.close().catch(() => {});
-			transports.delete(sessionId);
-		}
-	}
-}
-
-setInterval(cleanupStaleSessions, 5 * 60 * 1000);
-
 function formatDuration(millis: number | null): string {
 	if (!millis) return 'N/A';
 	const hours = Math.floor(millis / 3_600_000);
@@ -441,42 +426,25 @@ async function main(): Promise<void> {
 				return;
 			}
 
-			const sessionId = req.headers['mcp-session-id'] as string | undefined;
-
-			if (req.method === 'DELETE' && sessionId && transports.has(sessionId)) {
-				const session = transports.get(sessionId)!;
-				await session.transport.close();
-				transports.delete(sessionId);
-				res.status(200).send('Session closed');
+			if (req.method !== 'POST') {
+				res.status(405).send('Method not allowed');
 				return;
 			}
 
-			if (req.method === 'POST') {
-				let transport: StreamableHTTPServerTransport;
+			// Stateless: every request gets its own server and transport, so there
+			// is no session a restart or idle timeout could lose (clients would get
+			// "Server not initialized" and never recover). All state is in SQLite.
+			const mcpServer = createMcpServer();
+			const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+			res.on('close', () => {
+				transport.close().catch(() => {});
+				mcpServer.close().catch(() => {});
+			});
+			await mcpServer.connect(transport);
 
-				if (sessionId && transports.has(sessionId)) {
-					const session = transports.get(sessionId)!;
-					session.lastAccess = Date.now();
-					transport = session.transport;
-				} else {
-					transport = new StreamableHTTPServerTransport({
-						sessionIdGenerator: () => crypto.randomUUID(),
-						onsessioninitialized: newSessionId => {
-							transports.set(newSessionId, { transport, lastAccess: Date.now() });
-						},
-					});
-
-					const server = createMcpServer();
-					await server.connect(transport);
-				}
-
-				// express.json() has already consumed the request stream, so the
-				// parsed body must be handed over explicitly.
-				await transport.handleRequest(req, res, req.body);
-				return;
-			}
-
-			res.status(405).send('Method not allowed');
+			// express.json() has already consumed the request stream, so the
+			// parsed body must be handed over explicitly.
+			await transport.handleRequest(req, res, req.body);
 		});
 
 		// Apple Health data from the Health Auto Export app (REST API automation,
@@ -515,10 +483,6 @@ async function main(): Promise<void> {
 
 		const shutdown = (): void => {
 			process.stdout.write('\nShutting down...\n');
-			for (const [, session] of transports) {
-				session.transport.close().catch(() => {});
-			}
-			transports.clear();
 			db.close();
 			server.close(() => process.exit(0));
 		};
